@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { resolveProjectRegistration, projectRegistrationKey, validateProjectRepository } from '../services/projectRegistration';
 import fs from 'fs';
 import path from 'path';
 import type { IpcMain } from 'electron';
@@ -335,14 +335,15 @@ export function registerRunpaneHandlers(
         };
       }
 
-      validateRepositoryPath(normalized.path);
+      const registration = resolveProjectRegistration(normalized.path);
+      await validateProjectRepository(registration);
 
       const preview = {
         name: normalized.name,
-        path: normalized.path,
+        path: registration.path,
         alreadyExists: false,
         wouldCreate: true,
-        environment: new PathResolver({ path: normalized.path }).environment,
+        environment: registration.pathResolver.environment,
       };
 
       if (normalized.dryRun) {
@@ -356,11 +357,14 @@ export function registerRunpaneHandlers(
 
       const project = databaseService.createProject(
         normalized.name,
-        normalized.path,
+        registration.path,
         undefined,
         undefined,
         undefined,
         'ignore',
+        undefined,
+        registration.wsl_enabled || undefined,
+        registration.wsl_distribution,
       );
 
       try {
@@ -483,7 +487,7 @@ export function registerRunpaneHandlers(
           panes = [pane];
         } else {
           const session = databaseService.getSession(normalized.paneId);
-          if (!session) throw new Error(`No Pane pane found with id ${normalized.paneId}`);
+          if (!session) throw new Error(`No Pane pane found with id ${normalized.paneId}. Run \`runpane panes list\` to see Pane ids.`);
           panes = [{
             paneId: session.id,
             paneName: session.name,
@@ -3000,7 +3004,8 @@ function parseRepoAddRequest(value: PaneCommandValue): Required<Pick<RunpaneRepo
 
   const repoPath = expandUserRepoPath(requestedPath);
   const providedName = optionalString(value.name)?.trim();
-  const defaultName = path.basename(repoPath) || repoPath;
+  const location = resolveProjectRegistration(repoPath);
+  const defaultName = path.posix.basename(location.path.replace(/\\/g, '/')) || location.path;
 
   return {
     path: repoPath,
@@ -3012,7 +3017,7 @@ function parseRepoAddRequest(value: PaneCommandValue): Required<Pick<RunpaneRepo
 function resolvePane(sessionManager: AppServices['sessionManager'], paneId: string): Session {
   const session = sessionManager.getSession(paneId);
   if (!session) {
-    throw new Error(`No Pane pane found with id ${paneId}`);
+    throw new Error(`No Pane pane found with id ${paneId}. Run \`runpane panes list\` to see Pane ids.`);
   }
   return session;
 }
@@ -3277,7 +3282,7 @@ function parsePaneFocusRequest(value: PaneCommandValue): RunpanePaneFocusRequest
 function resolvePanel(panelId: string): ToolPanel {
   const panel = panelManager.getPanel(panelId);
   if (!panel) {
-    throw new Error(`No Pane panel found with id ${panelId}`);
+    throw new Error(`No Pane panel found with id ${panelId}. Run \`runpane panels list --pane <pane-id>\` to see panel ids.`);
   }
   return panel;
 }
@@ -3302,34 +3307,6 @@ function parsePaneCreateItem(value: PaneCommandValue, index: number): RunpanePan
     pinned: optionalBoolean(value.pinned) ?? true,
     tool: parseRunpaneToolSpec(value.tool, `Pane create item ${index}`),
   };
-}
-
-function validateRepositoryPath(repoPath: string): void {
-  const resolvedPath = expandUserRepoPath(repoPath);
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(resolvedPath);
-  } catch {
-    throw new Error(`Repo path does not exist: ${resolvedPath}`);
-  }
-
-  if (!stat.isDirectory()) {
-    throw new Error(`Repo path must be a directory: ${resolvedPath}`);
-  }
-
-  try {
-    const output = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd: resolvedPath,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-
-    if (output !== 'true') {
-      throw new Error('not inside work tree');
-    }
-  } catch {
-    throw new Error(`Repo path must be an existing git repository: ${resolvedPath}`);
-  }
 }
 
 function parseRunpaneToolSpec(value: PaneCommandValue, label: string): RunpaneToolSpec {
@@ -3411,7 +3388,7 @@ function resolveRepoSelector(projects: Project[], selector: RunpaneRepoSelector)
   if (selectorObject.id !== undefined) {
     const project = projects.find(candidate => candidate.id === selectorObject.id);
     if (!project) {
-      throw new Error(`No Pane repo found with id ${selectorObject.id}`);
+      throw new Error(`No Pane repo found with id ${selectorObject.id}. Run \`runpane repos list\` to see saved repos, or \`runpane repos add --path <absolute path> --yes\` to add one.`);
     }
     return project;
   }
@@ -3419,7 +3396,7 @@ function resolveRepoSelector(projects: Project[], selector: RunpaneRepoSelector)
   if (selectorObject.path !== undefined) {
     const project = resolveProjectByPath(projects, selectorObject.path);
     if (!project) {
-      throw new Error(`No Pane repo found at path ${selectorObject.path}`);
+      throw new Error(`No Pane repo found at path ${selectorObject.path}. Run \`runpane repos list\` to see saved repos, or \`runpane repos add --path <absolute path> --yes\` to add one.`);
     }
     return project;
   }
@@ -3440,14 +3417,14 @@ function resolveActiveProject(projects: Project[]): Project {
 }
 
 function resolveProjectByPath(projects: Project[], selectorPath: string): Project | undefined {
-  const normalized = path.resolve(selectorPath);
-  return projects.find(project => project.path === selectorPath || path.resolve(project.path) === normalized);
+  const key = projectRegistrationKey({ path: selectorPath });
+  return projects.find(project => projectRegistrationKey(project) === key);
 }
 
 function resolveProjectByName(projects: Project[], selectorName: string): Project {
   const matches = projects.filter(project => project.name.toLowerCase() === selectorName.toLowerCase());
   if (matches.length === 0) {
-    throw new Error(`No Pane repo found named "${selectorName}"`);
+    throw new Error(`No Pane repo found named "${selectorName}". Run \`runpane repos list\` to see saved repos, or \`runpane repos add --path <absolute path> --yes\` to add one.`);
   }
   if (matches.length > 1) {
     throw new Error(`Multiple Pane repos are named "${selectorName}". Use --repo-id or an exact path.`);
