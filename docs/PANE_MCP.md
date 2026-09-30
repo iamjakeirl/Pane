@@ -1,6 +1,6 @@
 # Pane MCP Server
 
-`runpane mcp` is an MCP server that gives coding agents Pane's `runpane` commands as tools. With it, an agent in any repository can list saved repositories, create Panes, open panels, read terminal screens, and send input. Pane also keeps a short `AGENTS.md` pointer in saved repositories so agents that don't have the MCP server yet can find the CLI and how to connect.
+`runpane mcp` is an MCP server that gives coding agents Pane's `runpane` commands as tools. With it, an agent in any repository can list saved repositories, create Panes, open panels, read terminal screens, and send input. Pane installs a `pane` skill in the user's home skill folders so agents can find the CLI and how to connect.
 
 ## Automatic registration
 
@@ -8,21 +8,24 @@ The Pane desktop app registers the server for you. On launch, Pane adds a `pane`
 
 - **Claude Code**: via `claude mcp add pane --scope user …`, which writes `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`).
 - **Codex**: a `[mcp_servers.pane]` table in `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`).
+- **Cursor**: a `mcpServers.pane` entry in `~/.cursor/mcp.json`. Pane detects Cursor from `~/.cursor`, `cursor`, `agent`, or `cursor-agent` on PATH.
 
-Pane registers only with the CLIs that are installed, and it manages only the entry it wrote:
+Packaged Pane also installs the on-demand `pane-manage-and-message-agents` user skill for detected Claude Code, Codex, and Cursor clients. Cursor uses `~/.cursor/skills/`; Claude Code and Codex use their user skill folders (including `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME`). Pane leaves hand-added skills alone and removes only its own copy when registration is off. The same applies inside detected WSL distros. [Cursor documents `~/.cursor/skills/` as a user-level Agent Skills directory](https://cursor.com/docs/skills).
+
+Pane registers only when it detects the corresponding client, and it manages only the entry it wrote:
 
 - It leaves other MCP servers and settings alone and never writes a second `pane` entry.
 - It rewrites its own entry when the app moves or updates.
-- A `pane` entry you added yourself (for example with `npx runpane mcp`) is left untouched, including when you turn the setting off. For Claude Code, Pane's entry is the one that runs `<Pane data dir>/mcp/runpane/dist/cli.js`. For Codex, it's the `[mcp_servers.pane]` table carrying the `# Managed by Pane` comment.
-- Pane edits `config.toml` as text, so your comments and formatting survive. It then parses the result and writes nothing unless the only change is Pane's own entry. Writes are atomic and follow a symlinked config.
+- A `pane` entry you added yourself (for example with `npx runpane mcp`) is left untouched, including when you turn the setting off. For Claude Code, Pane's entry is the one that runs `<Pane data dir>/mcp/runpane/dist/cli.js`. For Codex, it's the `[mcp_servers.pane]` table carrying the `# Managed by Pane` comment. For Cursor, it is the entry whose first argument is Pane's bundled runpane copy.
+- Pane edits `config.toml` as text, so your comments and formatting survive. It then parses the result and writes nothing unless the only change is Pane's own entry. Cursor JSON is parsed before editing; invalid JSON is left untouched. Writes are atomic and follow a symlinked config.
 
 On Windows, Pane also registers inside each WSL distro that has a saved WSL repository. Agents there run the Windows Pane binary through WSL interop.
 
 The registered command is the Pane executable in Node mode (`ELECTRON_RUN_AS_NODE=1`) running a copy of the runpane CLI at `<Pane data dir>/mcp/runpane/dist/cli.js`. No Node.js or npm install is needed. Only packaged builds register; a development build never touches your agent config.
 
-To turn this off, open **Settings → AI & Agents** and switch off **Register Pane tools with Claude Code and Codex**. Pane then removes its entry from each config.
+To turn this off, open **Settings → AI & Agents** and switch off **Register Pane tools with Claude Code, Codex, and Cursor**. Pane then removes its entry from each config.
 
-Restart a running `claude` or `codex` session to pick up a new registration. Check it with `claude mcp list` or `codex mcp list`.
+Restart a running `claude` or `codex` session to pick up a new registration. In Cursor, start a new chat or use **Developer: Reload Window**. Check with `claude mcp list`, `codex mcp list`, or `agent mcp list`. Cursor CLI may require `agent mcp enable pane` to add the server to its local approved list; Pane leaves that trust decision to you.
 
 ## Toolsets
 
@@ -35,7 +38,7 @@ A server that offers dozens of tools makes models, especially smaller ones, wors
 | `panes` | create, adopt, list, archive, restore, pin, unpin, rename, focus, cost, run and stop the run script, move to a folder, `folders_list`, `folders_create` |
 | `panels` | create, list, output, screen, input, submit, submit-composer, wait |
 | `git` | status, commit, push, pull, fetch, rebase onto main, squash-rebase onto main, stash, stash-pop, soft reset (`panes_*`) |
-| `sessions` | the eight `sessions_*` tools |
+| `sessions` | the eight `sessions_*` tools and the three named-lock tools (`lock_acquire`, `lock_release`, `lock_list`) |
 | `repos`, `docs`, `links`, `admin` | repository, documentation, deep-link, and diagnostic tools |
 | `all` / `read` | every tool / every read-only tool |
 
@@ -47,7 +50,7 @@ The core set is built around the three jobs agents most often need, each finishe
 
 - `agents_start`: creates a Pane in a repository, starts the agent with the task, waits until it is ready, and returns the pane and panel ids and a `pane://` link.
 - `agents_status`: whether the agent is working, ready, blocked (waiting on a person), idle, or exited, plus its current screen.
-- `agents_send`: submits a follow-up and reports whether Pane saw it leave the composer.
+- `agents_send`: submits a follow-up and reports whether the agent took it or queued it behind its current turn (`delivery`), read from the agent's transcript where Pane can find it.
 
 ## Docs and links
 
@@ -67,7 +70,7 @@ codex mcp add pane -- npx --yes runpane@latest mcp
 Cursor (`~/.cursor/mcp.json`):
 
 ```json
-{ "mcpServers": { "pane": { "command": "npx", "args": ["--yes", "runpane@latest", "mcp"] } } }
+{ "mcpServers": { "pane": { "type": "stdio", "command": "npx", "args": ["--yes", "runpane@latest", "mcp"] } } }
 ```
 
 VS Code (`.vscode/mcp.json`, or run **MCP: Add Server**):
@@ -77,6 +80,8 @@ VS Code (`.vscode/mcp.json`, or run **MCP: Add Server**):
 ```
 
 Any other client that can launch a stdio server uses the same command and arguments.
+
+`agents_send` uses the target agent's composer state. For Codex, it queues with Tab while the agent is working and submits with Enter when ready. A send is confirmed only after the text leaves the composer; if it remains, the result includes a command to retry the appropriate key. `panels_submit_composer` with `strategy: auto` uses the same keys.
 
 The server is stdio only: it runs next to the Pane app on the same machine, so there is no HTTP transport and no OAuth. To drive a remote Pane, run the server on the remote host.
 
@@ -88,11 +93,11 @@ Automated tests cover the registration and link logic on every OS. Check these b
 
 **macOS, Windows, and Linux**
 
-1. Install and launch Pane, with Claude Code and Codex installed.
-2. Run `claude mcp list` and `codex mcp list`. Each shows `pane` as connected.
+1. Install and launch Pane, with Claude Code, Codex, and Cursor installed.
+2. Run `claude mcp list`, `codex mcp list`, and `agent mcp list`. Each lists `pane`. If Cursor asks for approval, run `agent mcp enable pane`; it should report ready with 15 core tools.
 3. In a fresh `claude` session, ask "Use Pane to list my repos". It calls `repos_list`.
-4. Quit and relaunch Pane. The Claude and Codex configs are unchanged.
-5. Turn off **Settings → AI & Agents → Register Pane tools with Claude Code and Codex**. `pane` is gone from both lists, and the other entries are unchanged.
+4. Quit and relaunch Pane. The Claude, Codex, and Cursor configs are unchanged.
+5. Turn off **Settings → AI & Agents → Register Pane tools with Claude Code, Codex, and Cursor**. `pane` is gone from all three configs, and the other entries are unchanged.
 
 **pane:// links**
 
@@ -108,8 +113,8 @@ Automated tests cover the registration and link logic on every OS. Check these b
 
 **Windows with WSL**
 
-1. Save a repository that lives in a WSL distro, with Claude Code and Codex installed inside that distro.
-2. Relaunch Pane. Inside the distro, `claude mcp list` and `codex mcp list` show `pane`, whose command is `/mnt/c/.../Pane.exe`.
+1. Save a repository that lives in a WSL distro, with Claude Code, Codex, and Cursor installed inside that distro.
+2. Relaunch Pane. Inside the distro, `claude mcp list`, `codex mcp list`, and `agent mcp list` show `pane`, whose command is `/mnt/c/.../Pane.exe`.
 3. From a `claude` session inside the distro, ask "Use Pane to list my repos". The call reaches the Windows Pane.
 4. Turn the setting off. `pane` is gone from the distro's configs too.
 
@@ -155,8 +160,8 @@ A few flags are left out. `--json` is always passed. `--follow` is omitted becau
 
 Mutating tools keep the CLI's confirmation rule. Every command whose usage includes `--yes` gets a `yes` input. Without `yes: true`, the call fails with the CLI's own refusal and changes nothing. Tools are also annotated with `readOnlyHint`, so clients can auto-approve read-only tools and prompt for the rest.
 
-## AGENTS.md block
+## Agent guidance
 
-Pane still writes a short managed `<!-- pane-agent-context -->` block into each active repository's `AGENTS.md`. The block points agents at the RunPane CLI (`npm i -g runpane`, then `runpane doctor --json`) and at the `pane` MCP server, including Claude Code and Codex config. The full command catalog lives in MCP tools and `runpane agent-context`, not in the file.
+Pane installs a managed `pane` skill under `~/.claude/skills/pane` (or `$CLAUDE_CONFIG_DIR/skills/pane`) and `~/.agents/skills/pane`, including saved WSL distros on Windows. It leaves any existing skill without Pane's marker alone. **Install Pane skill for agents** in Settings → AI & Agents controls the installation; turning it off removes Pane's copy.
 
-Turning **Publish Pane instructions to AGENTS.md** off stops Pane from updating the block. It does not delete existing blocks.
+**Publish Pane instructions to AGENTS.md** is off by default. If enabled, Pane writes a marked block into the active repository's `AGENTS.md` with CLI and MCP setup instructions. Turning it off removes only Pane's marked block from saved repositories. On upgrade, Pane turns off the old default once and removes those blocks; a later opt-in is remembered. The full command catalog lives in MCP tools and `runpane agent-context`.

@@ -462,6 +462,7 @@
         "panes focus",
         "panels",
         "panels create",
+        "panels open",
         "panels list",
         "panels output",
         "panels input",
@@ -469,6 +470,7 @@
         "panels submit",
         "panels submit-composer",
         "panels wait",
+        "panels last-message",
         "agent-context",
         "mcp",
         "panes git-status",
@@ -494,6 +496,7 @@
         "agents start",
         "agents status",
         "agents send",
+        "report",
         "sessions",
         "sessions list",
         "sessions create",
@@ -502,7 +505,11 @@
         "sessions set-agent",
         "sessions associate",
         "sessions detach",
-        "sessions overview"
+        "sessions overview",
+        "lock",
+        "lock acquire",
+        "lock release",
+        "lock list"
       ],
       "properties": {
         "default": {
@@ -580,6 +587,9 @@
         "panels create": {
           "$ref": "#/$defs/helpLines"
         },
+        "panels open": {
+          "$ref": "#/$defs/helpLines"
+        },
         "panels list": {
           "$ref": "#/$defs/helpLines"
         },
@@ -599,6 +609,9 @@
           "$ref": "#/$defs/helpLines"
         },
         "panels wait": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "panels last-message": {
           "$ref": "#/$defs/helpLines"
         },
         "agent-context": {
@@ -676,6 +689,9 @@
         "agents send": {
           "$ref": "#/$defs/helpLines"
         },
+        "report": {
+          "$ref": "#/$defs/helpLines"
+        },
         "sessions": {
           "$ref": "#/$defs/helpLines"
         },
@@ -701,6 +717,18 @@
           "$ref": "#/$defs/helpLines"
         },
         "sessions overview": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "lock": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "lock acquire": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "lock release": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "lock list": {
           "$ref": "#/$defs/helpLines"
         }
       },

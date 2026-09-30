@@ -13,6 +13,7 @@ import { detectProjectBranch } from '../utils/detectProjectBranch';
 import { getGitAttributionEnv } from '../utils/attribution';
 import { detectProjectConfig } from '../services/projectConfigDetector';
 import { ensureProjectAgentContext } from '../services/agentContextManager';
+import { syncPaneHomeSkill } from '../services/paneHomeSkill';
 import type { ConfigManager } from '../services/configManager';
 import type { Project } from '../database/models';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
@@ -133,7 +134,7 @@ export function registerProjectHandlers(
       const { path: actualPath, wsl_enabled: wslEnabled, wsl_distribution: wslDistribution, pathResolver, commandRunner } = registration;
       let isGitRepo = false;
       if (wslDistribution) {
-        const wslError = validateWSLAvailable(wslDistribution);
+        const wslError = await validateWSLAvailable(wslDistribution);
         if (wslError) return { success: false, error: wslError };
       }
 
@@ -760,6 +761,9 @@ async function updateProjectAgentContextBestEffort(
 ): Promise<void> {
   try {
     await ensureProjectAgentContext(project, configManager.getConfig());
+    if (project.wsl_enabled && project.wsl_distribution) {
+      await syncPaneHomeSkill(configManager.getConfig(), [], [project.wsl_distribution]);
+    }
   } catch (error) {
     console.warn(`[Main] Failed to update Pane agent context during ${source}:`, error);
   }

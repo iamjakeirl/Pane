@@ -34,12 +34,17 @@ export interface ParsedArgs {
   resume?: string;
   name?: string;
   worktreeName?: string;
+  branch?: string;
   baseBranch?: string;
   agent?: RunpaneAgent;
   toolCommand?: string;
   title?: string;
+  url?: string;
+  file?: string;
+  placement?: 'split' | 'tab';
   initialInput?: string;
   initialInputFile?: string;
+  asFilePointer?: boolean;
   panelInput?: string;
   panelInputFile?: string;
   fromJson?: string;
@@ -56,8 +61,11 @@ export interface ParsedArgs {
   focus?: boolean;
   pinned?: boolean;
   noPinned?: boolean;
+  noAssociate?: boolean;
   composerStrategy?: string;
   force?: boolean;
+  removeWorktree?: boolean;
+  merged?: boolean;
   launch?: boolean;
   watchAs?: string;
   watchSince?: number;
@@ -81,17 +89,33 @@ export interface ParsedArgs {
   includeShells?: boolean;
   noHeldInput?: boolean;
   selfTest?: boolean;
+  /** Watch only: drop the _ok, _heartbeat, and _reconnected control lines. */
+  quiet?: boolean;
   report?: boolean;
   bodyFile?: string;
   message?: string;
   query?: string;
   doc?: string;
-  url?: string;
   keys?: string[];
   toolsets?: string[];
   readOnly?: boolean;
+  reportState?: ReportState;
+  reportPr?: number;
+  reportHead?: string;
+  summary?: string;
+  summaryFile?: string;
+  question?: string;
+  lockTtlMs?: number;
+  lockWaitMs?: number;
+  note?: string;
   remoteSetupArgs: string[];
 }
+
+/** `runpane report --state`: what a worker says about its task. */
+type ReportState = 'ready' | 'blocked' | 'failed' | 'done';
+const REPORT_STATES: readonly ReportState[] = ['ready', 'blocked', 'failed', 'done'];
+const reportStateSchema = boundary.enumeration('ready', 'blocked', 'failed', 'done');
+const HEAD_PATTERN = /^[0-9a-fA-F]{7,40}$/;
 
 const COMMAND_MATCHERS = RUNPANE_CONTRACT.commands
   .map((command) => ({ name: command.name, tokens: command.name.split(' ') }))
@@ -105,7 +129,10 @@ const targetSchema = boundary.enumeration(...RUNPANE_CONTRACT.enums.installTarge
 const formatSchema = boundary.enumeration(...RUNPANE_CONTRACT.enums.artifactFormats);
 const channelSchema = boundary.enumeration(...RUNPANE_CONTRACT.enums.channels);
 const agentSchema = boundary.enumeration(...RUNPANE_CONTRACT.enums.agents);
-const COMMAND_GROUP_HELP_TOPICS = new Set(['panes', 'panels', 'sessions', 'workspace']);
+const COMMAND_GROUP_HELP_TOPICS = new Set(['panes', 'panels', 'sessions', 'workspace', 'lock']);
+const LOCK_DURATION_PATTERN = /^(\d+)(ms|s|m|h)?$/u;
+const LOCK_DURATION_UNIT_MS = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 } as const;
+const MAX_LOCK_DURATION_MS = 86_400_000;
 
 const REMOTE_VALUE_FLAGS = new Set<string>(RUNPANE_CONTRACT.flags.remoteValue.map((flag) => flag.name));
 const REMOTE_BOOLEAN_FLAGS = new Set<string>(RUNPANE_CONTRACT.flags.remoteBoolean.map((flag) => flag.name));
@@ -185,8 +212,20 @@ export function parseRunpaneArgs(argv: string[]): ParsedArgs {
   }
 
   parseFlags(args, parsed);
+  if (parsed.command === 'watch' && parsed.follow && parsed.timeoutMs === 0) {
+    throw new Error('--timeout-ms must be greater than 0 with --follow.');
+  }
+  if (parsed.command === 'watch' && parsed.sessionId !== undefined && parsed.watchPaneIds?.length) {
+    throw new Error('runpane watch accepts either --session or --pane, not both; --session already follows every Pane in the Session.');
+  }
+  if (parsed.command === 'watch' && parsed.sessionId !== undefined && parsed.allManaged) {
+    throw new Error('runpane watch accepts either --session or --all-managed, not both.');
+  }
   if (parsed.command === 'watch' && parsed.allManaged && parsed.watchPaneIds?.length) {
     throw new Error('runpane watch accepts either --all-managed or --pane, not both.');
+  }
+  if (parsed.command === 'panes archive') {
+    validatePanesArchiveArgs(parsed);
   }
   if (parsed.command === 'watch' && parsed.json && parsed.watchFormat === 'lines') {
     throw new Error('runpane watch accepts either --json or --format lines, not both.');
@@ -198,7 +237,35 @@ export function parseRunpaneArgs(argv: string[]): ParsedArgs {
   if (parsed.command === 'watch' && parsed.watchSince !== undefined && cadenceValueFlagPresent) {
     throw new Error('runpane watch accepts either --since or --settle/--blocked-settle/--min-interval, not both (cadence needs a named cursor).');
   }
+  if (parsed.command === 'report') validateReportArgs(parsed);
   return parsed;
+}
+
+function validateReportArgs(parsed: ParsedArgs): void {
+  if (!parsed.reportState) {
+    throw new Error(`runpane report requires --state <${REPORT_STATES.join('|')}>.`);
+  }
+  if (parsed.summary !== undefined && parsed.summaryFile !== undefined) {
+    throw new Error('runpane report accepts either --summary or --summary-file, not both.');
+  }
+  if (parsed.reportState === 'blocked' && !parsed.question?.trim()) {
+    throw new Error('runpane report --state blocked requires --question "<what you need answered>".');
+  }
+}
+
+function validatePanesArchiveArgs(parsed: ParsedArgs): void {
+  if (parsed.paneId && parsed.sessionId) {
+    throw new Error('runpane panes archive accepts either --pane or --session, not both.');
+  }
+  if (parsed.merged && !parsed.sessionId) {
+    throw new Error('--merged requires --session.');
+  }
+  if (parsed.sessionId && !parsed.merged) {
+    throw new Error('runpane panes archive --session requires --merged.');
+  }
+  if (parsed.sessionId && parsed.force) {
+    throw new Error('runpane panes archive --session does not accept --force; archive one Pane with --pane to discard its work.');
+  }
 }
 
 function parseFlags(rawArgs: string[], parsed: ParsedArgs): void {
@@ -232,6 +299,11 @@ function parseFlags(rawArgs: string[], parsed: ParsedArgs): void {
     }
     if (isAgentContextCommand && arg === '--command') {
       parsed.contextCommand = readValue(args, ++index, arg, literalValues);
+      continue;
+    }
+    // Offline commands accept --pane-dir and ignore it, so one --pane-dir works for every command.
+    if ((isAgentContextCommand || parsed.command === 'version') && arg === '--pane-dir') {
+      parsed.paneDir = readValue(args, ++index, arg, literalValues);
       continue;
     }
     if (isLocalCommand && LOCAL_BOOLEAN_FLAGS.has(arg)) {
@@ -324,6 +396,13 @@ function parseLocalBooleanFlag(flag: string, parsed: ParsedArgs): void {
     parsed.focus = true;
     return;
   }
+  if (flag === '--split' || flag === '--tab') {
+    if (parsed.placement && parsed.placement !== flag.slice(2)) {
+      throw new Error('Use either --split or --tab, not both.');
+    }
+    parsed.placement = flag === '--split' ? 'split' : 'tab';
+    return;
+  }
   if (flag === '--pinned') {
     parsed.pinned = true;
     return;
@@ -332,12 +411,28 @@ function parseLocalBooleanFlag(flag: string, parsed: ParsedArgs): void {
     parsed.noPinned = true;
     return;
   }
+  if (flag === '--no-associate') {
+    parsed.noAssociate = true;
+    return;
+  }
   if (flag === '--force') {
     parsed.force = true;
     return;
   }
+  if (flag === '--remove-worktree') {
+    parsed.removeWorktree = true;
+    return;
+  }
+  if (flag === '--merged') {
+    parsed.merged = true;
+    return;
+  }
   if (flag === '--launch') {
     parsed.launch = true;
+    return;
+  }
+  if (flag === '--as-file-pointer') {
+    parsed.asFilePointer = true;
     return;
   }
   if (flag === '--follow') {
@@ -374,6 +469,13 @@ function parseLocalBooleanFlag(flag: string, parsed: ParsedArgs): void {
   }
   if (flag === '--self-test') {
     parsed.selfTest = true;
+    return;
+  }
+  if (flag === '--quiet' || flag === '--no-control-lines') {
+    if (parsed.command !== 'watch') {
+      throw new Error(`${flag} is only valid with runpane watch.`);
+    }
+    parsed.quiet = true;
     return;
   }
   if (flag === '--report') {
@@ -421,6 +523,14 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     parsed.repoPath = value;
     return;
   }
+  if (flag === '--url') {
+    parsed.url = value;
+    return;
+  }
+  if (flag === '--file') {
+    parsed.file = value;
+    return;
+  }
   if (flag === '--name') {
     parsed.name = value;
     return;
@@ -429,7 +539,11 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     parsed.worktreeName = value;
     return;
   }
-  if (flag === '--base-branch') {
+  if (flag === '--branch') {
+    parsed.branch = value;
+    return;
+  }
+  if (flag === '--base-branch' || flag === '--base') {
     parsed.baseBranch = value;
     return;
   }
@@ -468,7 +582,7 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     parsed.panelInputFile = value;
     return;
   }
-  if (flag === '--initial-input-file') {
+  if (flag === '--initial-input-file' || flag === '--prompt-file') {
     parsed.initialInputFile = value;
     return;
   }
@@ -535,8 +649,8 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     return;
   }
   if (flag === '--strategy') {
-    if (!['auto', 'codex-ctrl-enter', 'enter'].includes(value)) {
-      throw new Error('--strategy must be one of: auto, codex-ctrl-enter, enter.');
+    if (!['auto', 'codex-ctrl-enter', 'enter', 'tab'].includes(value)) {
+      throw new Error('--strategy must be one of: auto, codex-ctrl-enter, enter, tab.');
     }
     parsed.composerStrategy = value;
     return;
@@ -626,8 +740,62 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     parsed.toolsets = value.split(',').map((name) => name.trim()).filter(Boolean);
     return;
   }
+  if (flag === '--state') {
+    if (!REPORT_STATES.some((state) => state === value)) {
+      throw new Error(`--state must be one of: ${REPORT_STATES.join(', ')}.`);
+    }
+    parsed.reportState = decodeBoundary(value, reportStateSchema);
+    return;
+  }
+  if (flag === '--pr') {
+    const pr = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(pr) || pr <= 0) throw new Error('--pr must be a positive integer.');
+    parsed.reportPr = pr;
+    return;
+  }
+  if (flag === '--head') {
+    if (!HEAD_PATTERN.test(value)) throw new Error('--head must be a commit SHA of 7 to 40 hex characters.');
+    parsed.reportHead = value.toLowerCase();
+    return;
+  }
+  if (flag === '--summary') {
+    parsed.summary = value;
+    return;
+  }
+  if (flag === '--summary-file') {
+    parsed.summaryFile = value;
+    return;
+  }
+  if (flag === '--question') {
+    parsed.question = value;
+    return;
+  }
+  if (flag === '--ttl') {
+    parsed.lockTtlMs = parseLockTtl(value);
+    return;
+  }
+  if (flag === '--wait') {
+    const waitMs = parseNonNegativeIntegerFlag(flag, value);
+    if (waitMs > MAX_LOCK_DURATION_MS) throw new Error('--wait must be at most 86400000 (24h).');
+    parsed.lockWaitMs = waitMs;
+    return;
+  }
+  if (flag === '--note') {
+    parsed.note = value;
+    return;
+  }
 
   throw new Error(`Unknown option for ${parsed.command}: ${flag}`);
+}
+
+/** A lock TTL such as 90s, 30m, or 2h; a bare number is milliseconds. */
+function parseLockTtl(value: string): number {
+  const match = LOCK_DURATION_PATTERN.exec(value.trim());
+  if (!match) throw new Error('--ttl must be a duration such as 90s, 30m, or 2h (a bare number is milliseconds).');
+  const unit = match[2] === 'ms' || match[2] === 's' || match[2] === 'm' || match[2] === 'h' ? match[2] : 'ms';
+  const ttlMs = Number(match[1]) * LOCK_DURATION_UNIT_MS[unit];
+  if (ttlMs < 1_000 || ttlMs > MAX_LOCK_DURATION_MS) throw new Error('--ttl must be between 1s and 24h.');
+  return ttlMs;
 }
 
 function parseNonNegativeIntegerFlag(flag: string, value: string): number {
@@ -667,7 +835,11 @@ function isRunpaneLocalCommand(command: RunpaneCommand): boolean {
     || command === 'sessions associate'
     || command === 'sessions detach'
     || command === 'sessions overview'
+    || command === 'lock acquire'
+    || command === 'lock release'
+    || command === 'lock list'
     || command === 'panels create'
+    || command === 'panels open'
     || command === 'panels list'
     || command === 'panels output'
     || command === 'panels input'
@@ -675,6 +847,8 @@ function isRunpaneLocalCommand(command: RunpaneCommand): boolean {
     || command === 'panels submit'
     || command === 'panels submit-composer'
     || command === 'panels wait'
+    || command === 'panels last-message'
+    || command === 'report'
     || command === 'workspace state'
     || command === 'watch'
     || command === 'agents doctor'

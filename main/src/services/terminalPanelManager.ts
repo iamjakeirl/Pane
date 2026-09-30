@@ -1,3 +1,11 @@
+import { withRunpaneOnPath } from './runpaneShim';
+import { validateCustomCommandResume, customResumeAgentType } from '../../../shared/types/customCommandResume';
+import { prepareSessionWorkspace, sessionGitCeiling } from './sessionWorkspace';
+import { OrchestrationSessionStore } from './orchestrationSessionStore';
+import { getAppDirectory } from '../utils/appDirectory';
+import { codexResumeBase, claudeResumeBase, hasClaudeResumeFlag } from './agents/agentIdentity';
+import { canReadClaudeTranscripts, findClaudeSessionTranscript } from './claudeSessionTranscript';
+import { isOrchestrationInternalSessionId } from '../../../shared/types/orchestrationSession';
 import * as pty from '@lydell/node-pty';
 import { EventEmitter } from 'events';
 import { filterSyncBlockClears } from './syncBlockClearFilter';
@@ -36,6 +44,8 @@ const OUTPUT_BATCH_SIZE = 131072; // 128KB — timer-based flush preferred; size
 const OUTPUT_BATCH_SIZE_HIDDEN = 80_000; // 80KB — cap hidden flush size to avoid foreground backpressure churn
 const MAX_CONCURRENT_SPAWNS = 3;
 const AGENT_STATUS_POLL_MS = 500; // cadence for re-deriving blocked/working/done from the live screen
+/** Consecutive status polls whose screen must show an agent's signature before Pane adopts it. */
+const SCREEN_SIGNATURE_MATCHES = 2;
 const MAX_SCROLLBACK_BUFFER_SIZE = 500_000; // 500KB of normal shell history
 const MAX_ALTERNATE_SCREEN_BUFFER_SIZE = 100_000; // 100KB of recent TUI redraw state
 // Command-detection heuristic bounds. These buffers live in memory only and
@@ -50,6 +60,14 @@ const FORCED_REDRAW_TRANSITION_MS = 50;
 const FORCED_REDRAW_SETTLE_MS = 80;
 const SHELL_PROMPT_SETTLE_MS = 300;
 const SHELL_PROMPT_FALLBACK_MS = 5000;
+// Held initial input for an agent is staged, then submitted with its own
+// Enter once the agent has echoed it and gone quiet for a moment.
+const INPUT_SETTLE_POLL_MS = 50;
+const INPUT_SETTLE_QUIET_MS = 300;
+const INPUT_SETTLE_MAX_MS = 3000;
+const CLAUDE_INPUT_SETTLE_MIN_MS = 150;
+const CODEX_INPUT_SETTLE_MIN_MS = 500;
+const CODEX_SUBMIT_SEQUENCE = '\x1b[13;5u\r';
 // Formal ceiling for the restore/getState replay payload (now the emulator
 // serialization for normal buffers, raw ANSI log otherwise). Peer consensus:
 // Orca (TERMINAL_SCROLLBACK_REPLAY_BYTE_LIMIT) and Superset (MAX_HISTORY_SCROLLBACK_BYTES) both use
@@ -57,8 +75,26 @@ const SHELL_PROMPT_FALLBACK_MS = 5000;
 // practice; the cap is a backstop against pathological payloads.
 export const MAX_RESTORE_PAYLOAD_SIZE = 512 * 1024;
 
-import { CliAgentType, resolveAgentTypeFromCommand } from './agents/agentIdentity';
+import {
+  CliAgentType,
+  isShellProcessName,
+  isVersionedExecutableName,
+  normalizeProcessName,
+  resolveAgentTypeFromCommand,
+  resolveAgentTypeFromExecutablePath,
+  resolveAgentTypeFromProcessName,
+} from './agents/agentIdentity';
+import { detectAgentFromScreen } from './agents/agentScreenSignature';
+import { readForegroundExecutablePath } from '../utils/foregroundProcess';
 import { buildCursorLaunchCommand, createCursorReadyDetector, extractCursorChatId } from './agents/cursorLaunch';
+import {
+  bracketedPaste,
+  canLaunchWithPromptFile,
+  isLongPrompt,
+  normalizePromptNewlines,
+  promptFileShellWord,
+  stripTrailingNewlines,
+} from './agents/promptDelivery';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -227,10 +263,17 @@ interface TerminalProcess {
   isAlternateScreen: boolean;
   /** CLI agent driving this panel, when any — selects the status-detection manifest. */
   agentType?: CliAgentType;
+  /** Basename of the shell Pane spawned, to tell its prompt from a program running in it. */
+  shellProcessName?: string;
+  /** Foreground-process and screen evidence gathered while `agentType` is unresolved. */
+  agentProbe?: AgentProbe;
   /** Last status scan, reused while the emulator pushes no new screen. */
   lastStatusScan?: { screen: ScreenState; detection: AgentDetectionResult };
   /** The CLI came up with typed initial input still to send; the status poll sends it. */
   initialInputHeld?: boolean;
+  /** The program asked for bracketed paste (`CSI ?2004h`), so a paste reaches it as one. */
+  bracketedPasteMode?: boolean;
+  pasteModeSequenceTail?: string;
   // DEC Mode 2026 synchronized-output block tracking — persists across chunks
   inSyncBlock: boolean;
   /** Alt-screen state as seen by filterSyncBlockClears (stream-ordered, may
@@ -238,6 +281,21 @@ interface TerminalProcess {
   filterInAltScreen: boolean;
   capturedAgentSessionId?: string;
   agentSessionScrapeBuffer: string;
+}
+
+interface AgentProbe {
+  screen?: ScreenState;
+  screenAgent?: CliAgentType;
+  screenMatches: number;
+  processName?: string;
+  executableLookupInFlight?: boolean;
+}
+
+/** The program in the foreground of a panel's PTY, when the platform can tell. */
+export interface TerminalForegroundProcess {
+  name: string;
+  /** The foreground is Pane's own interactive shell, not a program started from it. */
+  isShell: boolean;
 }
 
 interface CliLaunchResolution {
@@ -261,8 +319,14 @@ export class TerminalPanelManager extends EventEmitter {
   private readonly agentStatusMonitor = new AgentStatusMonitor();
   private agentStatusPollTimer: ReturnType<typeof setInterval> | null = null;
 
-  /** Screen models parse PTY output on this host, off the main thread. */
-  constructor(private readonly emulatorHost: () => TerminalEmulatorHostConnection = sharedEmulatorThread) {
+  /**
+   * Screen models parse PTY output on this host, off the main thread.
+   * `readForegroundExecutable` names the program behind a versioned process name.
+   */
+  constructor(
+    private readonly emulatorHost: () => TerminalEmulatorHostConnection = sharedEmulatorThread,
+    private readonly readForegroundExecutable: (shellPid: number) => Promise<string | undefined> = readForegroundExecutablePath,
+  ) {
     super();
     this.setMaxListeners(100);
   }
@@ -271,13 +335,75 @@ export class TerminalPanelManager extends EventEmitter {
     return `"${value.replace(/([\\"$`])/g, '\\$1')}"`;
   }
 
+  /** An argument-mode prompt as one shell word: its prompt file read by the shell, or the quoted text. */
+  private initialPromptWord(customState: TerminalPanelState): string {
+    const fileWord = customState.initialInputFile ? promptFileShellWord(customState.initialInputFile) : undefined;
+    return fileWord ?? this.quoteCommandArgument(customState.initialInput ?? '');
+  }
+
+  /**
+   * Whether an agent launched in a new terminal for this context can read a
+   * long prompt with `"$(cat '<file>')"`: a POSIX shell, not WSL, PowerShell
+   * or cmd. Mirrors the shell choice in `initializeTerminal`.
+   */
+  launchShellReadsPromptFile(wslContext?: WSLContext | null): boolean {
+    if (wslContext && process.platform === 'win32') return false;
+    const shell = ShellDetector.getDefaultShell(getRuntimeConfigManager().getPreferredShell());
+    return canLaunchWithPromptFile(shell.name, false);
+  }
+
   private resolveCliLaunchCommand(
     panelId: string,
     initialCommand: string,
     customState: TerminalPanelState,
     shellType?: string,
+    isWSL = false,
   ): CliLaunchResolution {
-    const agentType = customState.agentType ?? resolveAgentTypeFromCommand(initialCommand);
+    if (customState.customResume) {
+      const config = validateCustomCommandResume(customState.customResume);
+      const allocated = config.mode === 'claude' || config.mode === 'generated';
+      const sessionId = customState.agentSessionId || (allocated ? randomUUID() : undefined);
+      const hasConversation = Boolean(customState.agentSessionId && (customState.customResumeStarted || customState.wasInterrupted));
+      // Claude resumes only an ID that has a transcript. When Pane can't see
+      // the transcripts, trust the recorded conversation like other modes.
+      const directClaude = /^claude(?:\s|$)/.test(initialCommand) && config.resumeTemplate.startsWith('{command} ');
+      const checkTranscript = config.mode === 'claude' && directClaude && !isWSL && canReadClaudeTranscripts();
+      const transcript = checkTranscript && sessionId ? findClaudeSessionTranscript(sessionId) : undefined;
+      const shouldResume = hasConversation && (!checkTranscript || Boolean(transcript));
+      const template = shouldResume ? config.resumeTemplate : config.initialTemplate || '{command}';
+      if (template.includes('{sessionId}') && !sessionId) throw new Error('No session ID is available for this launch template');
+      const commandToRun = template.replace(/\{command\}|\{sessionId\}/g, token =>
+        token === '{command}' ? initialCommand : this.quoteCommandArgument(sessionId!));
+      const agentType = customResumeAgentType(config) ?? customState.agentType;
+      return { commandToRun, isCliCommand: true, customState: {
+        ...customState, agentType, agentSessionId: sessionId, customResumeStarted: true,
+        isCliPanel: true, isCliReady: false, wasInterrupted: undefined,
+      } };
+    }
+    if (customState.launchMode === 'wrapped') {
+      // A wrapper runs the agent itself: never rewrite it with session ids,
+      // resume flags, or prompt arguments meant for the agent's own CLI.
+      if (!customState.agentType) {
+        return { commandToRun: initialCommand, customState, isCliCommand: false };
+      }
+      return {
+        commandToRun: initialCommand,
+        customState: {
+          ...customState,
+          isCliPanel: true,
+          isCliReady: false,
+          launchCommand: customState.launchCommand ?? initialCommand,
+          wasInterrupted: undefined,
+        },
+        isCliCommand: true,
+      };
+    }
+
+    const commandAgentType = resolveAgentTypeFromCommand(initialCommand);
+    const agentType = customState.agentType ?? commandAgentType;
+    if (customState.preserveLaunchCommand) {
+      return { commandToRun: initialCommand, customState, isCliCommand: Boolean(agentType) };
+    }
     if (!agentType) {
       return { commandToRun: initialCommand, customState, isCliCommand: false };
     }
@@ -287,13 +413,17 @@ export class TerminalPanelManager extends EventEmitter {
       isCliPanel: true,
       isCliReady: false,
       agentType,
+      agentDetection: customState.agentDetection ?? (commandAgentType === agentType ? 'command' : 'declared'),
+      launchCommand: customState.launchCommand ?? initialCommand,
     };
 
     const resolution = agentType === 'claude'
-      ? this.resolveClaudeLaunch(panelId, initialCommand, customState, nextState)
+      ? this.resolveClaudeLaunch(panelId, initialCommand, customState, nextState, isWSL)
       : agentType === 'codex'
         ? this.resolveCodexLaunch(panelId, initialCommand, customState, nextState)
-        : this.resolveCursorLaunch(panelId, initialCommand, customState, nextState, shellType);
+        : agentType === 'cursor'
+          ? this.resolveCursorLaunch(panelId, initialCommand, customState, nextState, shellType)
+          : undefined;
 
     return resolution ?? { commandToRun: initialCommand, customState: nextState, isCliCommand: true };
   }
@@ -303,20 +433,32 @@ export class TerminalPanelManager extends EventEmitter {
     initialCommand: string,
     customState: TerminalPanelState,
     nextState: TerminalPanelState,
+    isWSL = false,
   ): CliLaunchResolution | undefined {
     if (
       !initialCommand.includes('--session-id') &&
-      !initialCommand.includes('--resume')
+      !hasClaudeResumeFlag(initialCommand)
     ) {
-      const existingClaudeSessionId = isValidUuid(customState.agentSessionId)
+      const existingClaudeSessionId = customState.hasClaudeSessionId && customState.agentSessionId
         ? customState.agentSessionId
-        : isValidUuid(panelId)
-          ? panelId
-          : undefined;
+        : isValidUuid(customState.agentSessionId)
+          ? customState.agentSessionId
+          : isValidUuid(panelId)
+            ? panelId
+            : undefined;
       const claudeSessionId = existingClaudeSessionId ?? randomUUID();
-      const canResumeClaudeSession = customState.hasClaudeSessionId === true && Boolean(existingClaudeSessionId);
+      // An idle launch allocates an ID without creating a transcript. Also
+      // resolve old project locations explicitly for pre-cross-project CLIs.
+      // When Pane cannot see the transcripts (WSL, or a config dir set only in
+      // the shell), trust the recorded conversation.
+      const checkTranscript = Boolean(customState.orchestrationSessionId) && !isWSL && canReadClaudeTranscripts();
+      const transcript = checkTranscript && existingClaudeSessionId
+        ? findClaudeSessionTranscript(existingClaudeSessionId)
+        : undefined;
+      const canResumeClaudeSession = customState.hasClaudeSessionId === true && Boolean(existingClaudeSessionId)
+        && (!checkTranscript || Boolean(transcript));
       const initialPromptArg = customState.initialInputMode === 'argument' && customState.initialInput?.trim()
-        ? ` ${this.quoteCommandArgument(customState.initialInput)}`
+        ? ` ${this.initialPromptWord(customState)}`
         : '';
 
       nextState.hasClaudeSessionId = true;
@@ -329,7 +471,7 @@ export class TerminalPanelManager extends EventEmitter {
 
       return {
         commandToRun: canResumeClaudeSession
-          ? `claude --resume ${claudeSessionId} --dangerously-skip-permissions`
+          ? `${claudeResumeBase(initialCommand)} --resume ${this.quoteCommandArgument(transcript ?? claudeSessionId)}`
           : `${initialCommand} --session-id ${claudeSessionId}${initialPromptArg}`,
         customState: nextState,
         isCliCommand: true,
@@ -350,14 +492,16 @@ export class TerminalPanelManager extends EventEmitter {
     customState: TerminalPanelState,
     nextState: TerminalPanelState,
   ): CliLaunchResolution | undefined {
-    if (customState.wasInterrupted) {
+    const resumeBase = codexResumeBase(initialCommand);
+    if ((customState.wasInterrupted || customState.agentSessionId) && resumeBase !== undefined) {
       nextState.wasInterrupted = undefined;
-      // Keep Pane Chat's helper-subagent flags (`-c 'agents.…'`) on resume;
-      // other options, such as a prompt in a custom command, don't apply.
-      const launchOptions = (initialCommand.match(/ -c 'agents\.(?:[^']|'\\'')*'/g) ?? []).join('');
+      if (customState.orchestrationSessionId && !customState.agentSessionId) return { commandToRun: initialCommand, customState: nextState, isCliCommand: true };
+      const directoryArg = customState.orchestrationWorkspace && !/(?:^|\s)(?:--cd|-C)(?:=|\s)/.test(initialCommand)
+        ? ` --cd ${this.quoteCommandArgument(customState.orchestrationWorkspace)}`
+        : '';
       const commandToRun = customState.agentSessionId
-        ? `codex resume --yolo${launchOptions} ${customState.agentSessionId}`
-        : `codex resume --yolo${launchOptions}`;
+        ? `${resumeBase} resume ${this.quoteCommandArgument(customState.agentSessionId)}${directoryArg}`
+        : `${resumeBase} resume${directoryArg}`;
 
       if (customState.agentSessionId) {
         console.log(`[TerminalPanelManager] Resolved interrupted Codex panel ${panelId} to direct resume`);
@@ -380,7 +524,7 @@ export class TerminalPanelManager extends EventEmitter {
       nextState.initialInputSentAt = new Date().toISOString();
       nextState.initialInputError = undefined;
       return {
-        commandToRun: `${initialCommand} ${this.quoteCommandArgument(customState.initialInput)}`,
+        commandToRun: `${initialCommand} ${this.initialPromptWord(customState)}`,
         customState: nextState,
         isCliCommand: true,
       };
@@ -396,8 +540,12 @@ export class TerminalPanelManager extends EventEmitter {
     nextState: TerminalPanelState,
     shellType?: string,
   ): CliLaunchResolution | undefined {
-    if (customState.wasInterrupted) {
+    if ((customState.wasInterrupted || customState.agentSessionId) && (!customState.orchestrationSessionId || customState.agentSessionId)) {
       nextState.wasInterrupted = undefined;
+      // Older adopted panels stored an already-expanded resume command.
+      if (/--resume\b|--continue\b/.test(initialCommand)) {
+        return { commandToRun: initialCommand, customState: nextState, isCliCommand: true };
+      }
       const commandToRun = customState.agentSessionId
         ? buildCursorLaunchCommand({ baseCommand: initialCommand, resumeChatId: customState.agentSessionId })
         : `${initialCommand} --continue`;
@@ -420,8 +568,9 @@ export class TerminalPanelManager extends EventEmitter {
         nextState.initialInputSentAt = new Date().toISOString();
         nextState.initialInputError = undefined;
       }
+      const promptWord = promptArgument && customState.initialInputFile ? this.initialPromptWord(customState) : undefined;
       return {
-        commandToRun: buildCursorLaunchCommand({ baseCommand: initialCommand, promptArgument, shellType }),
+        commandToRun: buildCursorLaunchCommand({ baseCommand: initialCommand, promptArgument, promptWord, shellType }),
         customState: nextState,
         isCliCommand: true,
       };
@@ -523,16 +672,47 @@ export class TerminalPanelManager extends EventEmitter {
   ): void {
     const terminal = this.terminals.get(panelId);
     if (!terminal || terminal.destroying) return;
-    if (submitStrategy === 'codex-ctrl-enter') {
-      this.writeToTerminal(panelId, input);
-      setTimeout(() => {
-        if (this.terminals.get(panelId) !== terminal || terminal.destroying) return;
-        this.writeToTerminal(panelId, '\x1b[13;5u\r');
-      }, 500);
+    // An agent reads text and Enter arriving together as a paste and keeps
+    // the Enter as a newline, so agents get the Enter as its own write.
+    if (submitStrategy === 'codex-ctrl-enter' || terminal.agentType) {
+      void this.stageAndSubmitInitialInput(terminal, input, submitStrategy);
       return;
     }
 
     this.writeToTerminal(panelId, input.endsWith('\r') ? input : `${input}\r`);
+  }
+
+  /**
+   * Stage initial input in an agent's composer, as a bracketed paste when it
+   * is long or multi-line, then send the submit key once the agent has
+   * echoed it and gone quiet (bounded).
+   */
+  private async stageAndSubmitInitialInput(
+    terminal: TerminalProcess,
+    input: string,
+    submitStrategy: NonNullable<TerminalPanelState['initialInputSubmitStrategy']>,
+  ): Promise<void> {
+    const text = stripTrailingNewlines(normalizePromptNewlines(input));
+    const generation = terminal.outputGeneration;
+    this.writeToTerminal(terminal.panelId, isLongPrompt(text) && terminal.bracketedPasteMode ? bracketedPaste(text) : text);
+    const isCodex = submitStrategy === 'codex-ctrl-enter';
+    await this.waitForInputSettle(terminal, generation, isCodex ? CODEX_INPUT_SETTLE_MIN_MS : CLAUDE_INPUT_SETTLE_MIN_MS);
+    if (this.terminals.get(terminal.panelId) !== terminal || terminal.destroying) return;
+    this.writeToTerminal(terminal.panelId, isCodex ? CODEX_SUBMIT_SEQUENCE : '\r');
+  }
+
+  /** Resolve once the terminal has output since `generation` and then a quiet window, or after a bound. */
+  private async waitForInputSettle(terminal: TerminalProcess, generation: number, minMs: number): Promise<void> {
+    const startedAt = Date.now();
+    for (;;) {
+      await new Promise(resolve => setTimeout(resolve, INPUT_SETTLE_POLL_MS));
+      if (this.terminals.get(terminal.panelId) !== terminal || terminal.destroying) return;
+      const elapsed = Date.now() - startedAt;
+      if (elapsed >= INPUT_SETTLE_MAX_MS) return;
+      const echoed = terminal.outputGeneration > generation;
+      const quiet = !terminal.lastOutputAt || Date.now() - terminal.lastOutputAt.getTime() >= INPUT_SETTLE_QUIET_MS;
+      if (elapsed >= minMs && echoed && quiet) return;
+    }
   }
 
   private stripAnsiSequences(output: string): string {
@@ -579,21 +759,23 @@ export class TerminalPanelManager extends EventEmitter {
   }
 
   private captureAgentSessionId(terminal: TerminalProcess, output: string): void {
-    if (terminal.agentType !== 'codex' && terminal.agentType !== 'cursor') return;
+    const panel = panelManager.getPanel(terminal.panelId);
+    if (!panel) return;
+    const customState = terminalCustomState(panel.state);
+    if (!customState.customResume && terminal.agentType !== 'codex' && terminal.agentType !== 'cursor') return;
 
     terminal.agentSessionScrapeBuffer = trimAnsiSafe(
       terminal.agentSessionScrapeBuffer + output,
       2000
     );
 
-    const agentSessionId = this.extractAgentSessionId(terminal.agentType, terminal.agentSessionScrapeBuffer);
+    if (customState.customResume?.mode === 'generated') return;
+    const agentSessionId = customState.customResume?.mode === 'reported'
+      ? Array.from(terminal.agentSessionScrapeBuffer.matchAll(/(?:^|[\r\n])PANE_AGENT_SESSION_ID=([A-Za-z0-9][A-Za-z0-9._:-]{0,255})(?=[\r\n])/g)).at(-1)?.[1]
+      : this.extractAgentSessionId(terminal.agentType, terminal.agentSessionScrapeBuffer);
     if (!agentSessionId) return;
 
-    const panel = panelManager.getPanel(terminal.panelId);
-    if (!panel) return;
-
-    const customState = terminalCustomState(panel.state);
-    const agentType = customState.agentType ?? resolveAgentTypeFromCommand(customState.initialCommand);
+    const agentType = this.resolveTerminalAgentType(customState);
     if (agentType !== terminal.agentType || customState.agentSessionId === agentSessionId) return;
 
     terminal.capturedAgentSessionId = agentSessionId;
@@ -888,9 +1070,32 @@ export class TerminalPanelManager extends EventEmitter {
     }
   }
 
+  async stageInitialCommand(panelId: string, initialCommand: string): Promise<void> {
+    const panel = panelManager.getPanel(panelId);
+    if (!panel) throw new Error(`Panel ${panelId} not found`);
+    const state = terminalCustomState(panel.state);
+    const launch = this.resolveCliLaunchCommand(panelId, initialCommand, state, state.shellType);
+    panel.state.customState = launch.customState;
+    await panelManager.updatePanel(panelId, { state: panel.state });
+    this.writeToTerminal(panelId, launch.commandToRun);
+  }
+
   async initializeTerminal(panel: ToolPanel, cwd: string, wslContext?: WSLContext | null, priority: number = 1, initialDimensions?: { cols: number; rows: number }): Promise<void> {
     if (this.terminals.has(panel.id)) {
       return;
+    }
+
+    const sessionState = terminalCustomState(panel.state);
+    if (sessionState.orchestrationSessionId || isOrchestrationInternalSessionId(panel.sessionId)) {
+      // Also cover supervisor restoration before the Session manager refreshes
+      // old launch records. Never deliver historical bootstrap input again.
+      panel.state.customState = { ...sessionState, initialInput: undefined };
+    }
+    cwd = sessionState.orchestrationWorkspace ?? cwd;
+    if (sessionState.orchestrationSessionId) {
+      const record = new OrchestrationSessionStore(path.join(getAppDirectory(), 'orchestration-sessions.json'))
+        .read().sessions.find(item => item.id === sessionState.orchestrationSessionId);
+      cwd = prepareSessionWorkspace(sessionState.orchestrationSessionId, record?.profile ?? sessionState.orchestrationProfile, record);
     }
 
     // Wait for a spawn slot (caps concurrent PTY spawns to prevent CPU spikes)
@@ -970,8 +1175,11 @@ export class TerminalPanelManager extends EventEmitter {
 
     // The ptyHost RPC DTO requires `Record<string, string>`, so both the legacy
     // `pty.spawn` path and the ptyHost path get the same undefined-free shape.
+    const inheritedEnv = interactiveTerminalEnv();
+    // A Pane launched from an orchestrator must not inherit the parent's role.
+    delete inheritedEnv.PANE_ORCHESTRATION_SESSION_ID;
     const baseSpawnEnv = {
-      ...interactiveTerminalEnv(),
+      ...inheritedEnv,
       ...getGitAttributionEnv(getRuntimeConfigManager().getConfig()),
       PATH: enhancedPath,
       TERM: 'xterm-256color',
@@ -984,9 +1192,14 @@ export class TerminalPanelManager extends EventEmitter {
       PANE_WORKSPACE_PATH: cwd,
       ...wslEnvVars,
     } satisfies Record<string, string>;
-    const spawnEnv = panelCustomState.orchestrationSessionId
-      ? { ...baseSpawnEnv, PANE_ORCHESTRATION_SESSION_ID: panelCustomState.orchestrationSessionId }
+    const roleEnv: Record<string, string> = panelCustomState.orchestrationSessionId
+      ? { ...baseSpawnEnv, PANE_ORCHESTRATION_SESSION_ID: panelCustomState.orchestrationSessionId, GIT_CEILING_DIRECTORIES: sessionGitCeiling() }
       : baseSpawnEnv;
+    // Pane's own runpane goes first on PATH (see runpaneShim.ts). WSL shells
+    // cannot run the Windows Electron binary, so they keep their own PATH.
+    const launch = isWSL ? { args: shellArgs, env: roleEnv } : withRunpaneOnPath({ name: shellType, args: shellArgs }, roleEnv);
+    shellArgs = launch.args;
+    const spawnEnv = launch.env;
 
     // Read the setting once per spawn so we don't scatter config reads.
     // `getPtyHostRuntime()` returns null when the setting is off or when
@@ -1070,6 +1283,7 @@ export class TerminalPanelManager extends EventEmitter {
       inSyncBlock: false,
       filterInAltScreen: false,
       agentType: this.resolveTerminalAgentType(terminalCustomState(panel.state)),
+      shellProcessName: normalizeProcessName(shellPath),
       agentSessionScrapeBuffer: ''
     };
 
@@ -1100,8 +1314,19 @@ export class TerminalPanelManager extends EventEmitter {
 
     // Wait for the shell prompt before sending an initial command.
     let commandToRun: string | undefined;
+    let launchResolution: CliLaunchResolution | undefined;
     if (initialCommand) {
-      const launchResolution = this.resolveCliLaunchCommand(panel.id, initialCommand, existingState || {}, shellType);
+      try {
+        launchResolution = this.resolveCliLaunchCommand(panel.id, initialCommand, existingState || {}, shellType, terminalProcess.isWSL);
+      } catch (error) {
+        // Leave the shell usable and say why the command did not start.
+        const reason = error instanceof Error ? error.message : String(error);
+        console.warn(`[TerminalPanelManager] Could not launch ${initialCommand} in panel ${panel.id}:`, error);
+        terminalProcess.outputBuffer += `\r\n\x1b[31mPane could not start "${initialCommand}": ${reason}\x1b[0m\r\n`;
+        this.flushOutputBuffer(terminalProcess);
+      }
+    }
+    if (initialCommand && launchResolution) {
       commandToRun = launchResolution.commandToRun;
       const isCliCommand = launchResolution.isCliCommand;
 
@@ -1219,6 +1444,14 @@ export class TerminalPanelManager extends EventEmitter {
       // Detect alternate screen buffer enter/exit for universal TUI detection
       // (works on WSL where pty.process reports wsl.exe instead of the Linux foreground app)
       // \x1b[?1049h = enter alternate screen, \x1b[?1049l = leave alternate screen
+      const pasteModeData = (terminal.pasteModeSequenceTail ?? '') + data;
+      terminal.pasteModeSequenceTail = pasteModeData.slice(-7);
+      if (pasteModeData.includes('\x1b[?2004')) {
+        const lastEnable = pasteModeData.lastIndexOf('\x1b[?2004h');
+        const lastDisable = pasteModeData.lastIndexOf('\x1b[?2004l');
+        if (lastEnable !== lastDisable) terminal.bracketedPasteMode = lastEnable > lastDisable;
+      }
+
       const enterAlt = data.includes('\x1b[?1049h');
       const leaveAlt = data.includes('\x1b[?1049l');
       if (enterAlt || leaveAlt) {
@@ -1365,13 +1598,23 @@ export class TerminalPanelManager extends EventEmitter {
     return this.terminals.get(panelId)?.lastOutputAt?.toISOString();
   }
 
-  /** Viewport text with dim cells blanked, so placeholder hints do not read as typed input. */
+  /** Viewport text with ghost cells (dim or placeholder grey) blanked, so placeholder hints do not read as typed input. */
   getInputScreenText(panelId: string): string | undefined {
     return this.terminals.get(panelId)?.screenEmulator?.state.inputScreenText;
   }
 
+  /** Only the viewport's ghost cells, row for row with getInputScreenText. */
+  getGhostScreenText(panelId: string): string | undefined {
+    return this.terminals.get(panelId)?.screenEmulator?.state.ghostScreenText;
+  }
+
   getOutputGeneration(panelId: string): number {
     return this.terminals.get(panelId)?.outputGeneration ?? 0;
+  }
+
+  /** Whether the program in the panel has turned on bracketed paste. */
+  isBracketedPasteEnabled(panelId: string): boolean {
+    return this.terminals.get(panelId)?.bracketedPasteMode === true;
   }
   
   writeToTerminal(panelId: string, data: string): void {
@@ -1620,7 +1863,7 @@ export class TerminalPanelManager extends EventEmitter {
 
     const panel = panelManager.getPanel(panelId);
     const customState = panel ? terminalCustomState(panel.state) : {};
-    const agentType = customState.agentType ?? resolveAgentTypeFromCommand(customState.initialCommand);
+    const agentType = customState.agentType ?? resolveAgentTypeFromCommand(customState.initialCommand) ?? terminal.agentType;
 
     return {
       initialized: true,
@@ -1683,6 +1926,9 @@ export class TerminalPanelManager extends EventEmitter {
   private resolveTerminalAgentType(
     customState: TerminalPanelState | undefined,
   ): CliAgentType | undefined {
+    if (customState?.customResume) {
+      return customResumeAgentType(customState.customResume) ?? customState.agentType;
+    }
     return customState?.agentType ?? resolveAgentTypeFromCommand(customState?.initialCommand);
   }
 
@@ -1732,7 +1978,6 @@ export class TerminalPanelManager extends EventEmitter {
     try {
       for (const terminal of this.terminals.values()) {
         if (terminal.destroying || !this.agentStatusMonitor.isTracked(terminal.panelId)) continue;
-        const manifest = getManifestForAgent(terminal.agentType);
         const emulator = terminal.screenEmulator;
         if (!emulator) continue;
 
@@ -1740,6 +1985,8 @@ export class TerminalPanelManager extends EventEmitter {
         // The emulator only pushes a new object when the screen changed, so an
         // idle panel reuses its last detection instead of rescanning.
         const screen = emulator.state;
+        if (!terminal.agentType) this.detectForegroundAgent(terminal, screen);
+        const manifest = getManifestForAgent(terminal.agentType);
         let detection = terminal.lastStatusScan?.screen === screen ? terminal.lastStatusScan.detection : null;
         if (!detection) {
           detection = detectAgentState(manifest, {
@@ -1756,6 +2003,149 @@ export class TerminalPanelManager extends EventEmitter {
     } catch (error) {
       console.error('[TerminalPanelManager] agent status poll failed:', error);
     }
+  }
+
+  /**
+   * The program in the foreground of a panel's PTY. Undefined on Windows, WSL
+   * and ptyHost terminals, where node-pty cannot name it.
+   */
+  getForegroundProcess(panelId: string): TerminalForegroundProcess | undefined {
+    const terminal = this.terminals.get(panelId);
+    if (!terminal || terminal.destroying) return undefined;
+    const name = this.readForegroundProcessName(terminal);
+    if (!name) return undefined;
+    return { name, isShell: this.isInteractiveShellProcess(terminal, name) };
+  }
+
+  private readForegroundProcessName(terminal: TerminalProcess): string | undefined {
+    if (terminal.isPtyHost || terminal.isWSL || process.platform === 'win32') return undefined;
+    try {
+      return terminal.pty.process || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isInteractiveShellProcess(terminal: TerminalProcess, name: string): boolean {
+    if (!isShellProcessName(name)) return false;
+    // A shell-script wrapper is a shell too; only Pane's own shell is a prompt.
+    return terminal.shellProcessName === undefined || normalizeProcessName(name) === terminal.shellProcessName;
+  }
+
+  /**
+   * Resolve the agent behind a wrapper or an unknown launch command: first the
+   * foreground process (`claude`, `codex`, `cursor-agent`, or Claude's
+   * versioned binary), then the agent's screen signature on consecutive polls.
+   */
+  private detectForegroundAgent(terminal: TerminalProcess, screen: ScreenState): void {
+    const probe = terminal.agentProbe ??= { screenMatches: 0 };
+    const processName = this.readForegroundProcessName(terminal);
+    const processAgent = resolveAgentTypeFromProcessName(processName);
+    if (processAgent) {
+      this.applyDetectedAgent(terminal, processAgent, 'process');
+      return;
+    }
+    if (processName !== probe.processName) {
+      probe.processName = processName;
+      if (isVersionedExecutableName(processName)) this.lookupForegroundExecutable(terminal, probe);
+    }
+
+    // Pane's own shell at its prompt can still show an agent's last frame.
+    if (processName && this.isInteractiveShellProcess(terminal, processName)) {
+      probe.screen = undefined;
+      probe.screenAgent = undefined;
+      probe.screenMatches = 0;
+      return;
+    }
+    const screenAgent = probe.screen === screen ? probe.screenAgent : detectAgentFromScreen(screen.screenText);
+    probe.screenMatches = screenAgent && screenAgent === probe.screenAgent ? probe.screenMatches + 1 : screenAgent ? 1 : 0;
+    probe.screen = screen;
+    probe.screenAgent = screenAgent;
+    if (screenAgent && probe.screenMatches >= SCREEN_SIGNATURE_MATCHES) {
+      this.applyDetectedAgent(terminal, screenAgent, 'screen');
+    }
+  }
+
+  private lookupForegroundExecutable(terminal: TerminalProcess, probe: AgentProbe): void {
+    if (probe.executableLookupInFlight) return;
+    probe.executableLookupInFlight = true;
+    this.readForegroundExecutable(terminal.pty.pid)
+      .then((executablePath) => {
+        if (this.terminals.get(terminal.panelId) !== terminal || terminal.destroying || terminal.agentType) return;
+        const agentType = resolveAgentTypeFromExecutablePath(executablePath);
+        if (agentType) this.applyDetectedAgent(terminal, agentType, 'process');
+      })
+      .catch((error) => {
+        console.warn(`[TerminalPanelManager] Could not read the foreground executable for panel ${terminal.panelId}:`, error);
+      })
+      .finally(() => {
+        probe.executableLookupInFlight = false;
+      });
+  }
+
+  /** Record a detected wrapper agent so submit, status, `panels list` and watch treat the panel as that agent. */
+  private applyDetectedAgent(terminal: TerminalProcess, agentType: CliAgentType, detection: 'process' | 'screen'): void {
+    terminal.agentType = agentType;
+    terminal.agentProbe = undefined;
+    terminal.lastStatusScan = undefined;
+
+    const panel = panelManager.getPanel(terminal.panelId);
+    if (!panel) return;
+    const customState = terminalCustomState(panel.state);
+    panel.state.customState = {
+      ...customState,
+      agentType,
+      agentDetection: detection,
+      isCliPanel: true,
+      isCliReady: true,
+      launchMode: 'wrapped',
+      launchCommand: customState.launchCommand ?? customState.initialCommand,
+    };
+    void panelManager.updatePanel(terminal.panelId, { state: panel.state }).catch(error => {
+      console.warn(`[TerminalPanelManager] Failed to persist detected ${agentType} for panel ${terminal.panelId}:`, error);
+    });
+    console.log(`[TerminalPanelManager] Detected ${agentType} in panel ${terminal.panelId} from its ${detection}`);
+
+    // Watchers ignored this panel's earlier transitions; restate where it is now.
+    const state = this.agentStatusMonitor.getState(terminal.panelId);
+    if (state) this.emitAgentStatus(terminal, state, 'agent_detected');
+  }
+
+  /** Finish saving and confirm process exit before a conversation changes owner. */
+  async stopForPromotion(panelId: string): Promise<void> {
+    const terminal = this.terminals.get(panelId);
+    if (!terminal) return;
+    if (terminal.screenEmulator) await terminal.screenEmulator.refresh();
+    if (!this.isIdleForPromotion(terminal)) throw new Error('Wait for the agent to finish before moving this chat');
+    await this.saveTerminalState(panelId);
+    if (terminal.screenEmulator) await terminal.screenEmulator.refresh();
+    if (!this.isIdleForPromotion(terminal)) throw new Error('The agent started working; try again when idle');
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { subscription.dispose(); reject(new Error('Agent did not stop; the chat has not been moved')); }, 5000);
+      const subscription = terminal.pty.onExit(() => { clearTimeout(timer); subscription.dispose(); resolve(); });
+      try { terminal.pty.kill(); }
+      catch (error) { clearTimeout(timer); subscription.dispose(); reject(error); }
+    });
+    if (terminal.outputFlushTimer) clearTimeout(terminal.outputFlushTimer);
+    disposeFlowControlRecord(terminal.flowControl);
+    this.serializedBuffers.delete(panelId);
+  }
+
+  private isIdleForPromotion(terminal: TerminalProcess): boolean {
+    const emulator = terminal.screenEmulator;
+    if (emulator) {
+      const { screenText, oscTitle, oscProgress } = emulator.state;
+      const detection = detectAgentState(getManifestForAgent(terminal.agentType), {
+        screen: screenText,
+        oscTitle,
+        oscProgress,
+      });
+      if (detection.visibleWorking || detection.visibleBlocker || detection.skipStateUpdate) return false;
+      // The sidebar deliberately holds "working" after output. A live input
+      // prompt is stronger evidence for this explicit user-requested move.
+      if (detection.visibleIdle) return true;
+    }
+    return this.getAgentStatus(terminal.panelId) === 'idle';
   }
 
   destroyTerminal(panelId: string, options: { saveState?: boolean } = {}): Promise<void> {

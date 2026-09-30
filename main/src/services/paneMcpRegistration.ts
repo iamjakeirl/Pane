@@ -10,6 +10,7 @@ import { getAppDirectory } from '../utils/appDirectory';
 import { getShellPath } from '../utils/shellPath';
 import { escapeForBash, linuxToUNCPath, windowsPathToWSLMount } from '../utils/wslUtils';
 import { parse as parseToml } from 'smol-toml';
+import { syncPaneUserSkills, type UserSkillTarget } from './paneUserSkills';
 import { boundary, decodeBoundary, decodeOptionalBoundary, type JsonObject, type JsonValue } from '../../../shared/validation/boundaryDecoder';
 
 const execFileAsync = promisify(execFile);
@@ -33,12 +34,15 @@ export interface McpRegistrationTarget {
   claude?: { configPath: string; run: (args: string[]) => Promise<void> };
   /** Present when Codex is installed. */
   codex?: { configPath: string };
+  /** Present when Cursor is installed. */
+  cursor?: { configPath: string };
+  userSkills?: UserSkillTarget[];
 }
 
 type RegistrationAction = 'added' | 'updated' | 'removed' | 'unchanged' | 'skipped';
 
 export interface RegistrationOutcome {
-  client: 'Claude Code' | 'Codex';
+  client: 'Claude Code' | 'Codex' | 'Cursor';
   action: RegistrationAction;
   detail?: string;
 }
@@ -46,12 +50,15 @@ export interface RegistrationOutcome {
 /** Adds, repairs, or removes the `pane` MCP server in every agent config the target has. */
 export async function syncMcpRegistration(target: McpRegistrationTarget, enabled: boolean): Promise<RegistrationOutcome[]> {
   const outcomes: RegistrationOutcome[] = [];
-  const { claude, codex } = target;
+  const { claude, codex, cursor } = target;
   if (claude) {
     outcomes.push(await settle('Claude Code', () => syncClaude(claude, target.server, enabled)));
   }
   if (codex) {
     outcomes.push(await settle('Codex', () => syncCodex(codex.configPath, target.server, enabled)));
+  }
+  if (cursor) {
+    outcomes.push(await settle('Cursor', () => syncCursor(cursor.configPath, target.server, enabled)));
   }
   return outcomes;
 }
@@ -140,6 +147,35 @@ function sameClaudeEntry(entry: ClaudeEntry, server: PaneMcpServerEntry): boolea
     && entry.command === server.command
     && JSON.stringify(entry.args ?? []) === JSON.stringify(server.args)
     && sortedEnv(entry.env ?? {}) === sortedEnv(server.env);
+}
+
+async function syncCursor(configPath: string, server: PaneMcpServerEntry, enabled: boolean): Promise<Omit<RegistrationOutcome, 'client'>> {
+  const current = await readIfExists(configPath);
+  let config: JsonObject = {};
+  if (current !== undefined && current.trim() !== '') {
+    try {
+      config = decodeBoundary(JSON.parse(current), boundary.jsonObject);
+    } catch {
+      return { action: 'skipped', detail: `${configPath} is not valid JSON; left it unchanged` };
+    }
+  }
+  const servers = config.mcpServers === undefined ? {} : decodeOptionalBoundary(config.mcpServers, boundary.jsonObject);
+  if (!servers) return { action: 'skipped', detail: `${configPath} has an invalid mcpServers object; left it unchanged` };
+  const existing = servers[PANE_MCP_SERVER_NAME];
+  if (existing !== undefined) {
+    const entry = decodeOptionalBoundary(existing, claudeEntrySchema);
+    if (!entry || entry.args?.[0] !== server.args[0]) {
+      return { action: 'skipped', detail: `${configPath} has a "pane" MCP server that Pane did not add; left it unchanged` };
+    }
+    if (enabled && sameClaudeEntry(entry, server) && entry.type === 'stdio') return { action: 'unchanged' };
+  } else if (!enabled) return { action: 'unchanged' };
+
+  const nextServers = { ...servers };
+  if (enabled) nextServers[PANE_MCP_SERVER_NAME] = { type: 'stdio', ...server };
+  else delete nextServers[PANE_MCP_SERVER_NAME];
+  config.mcpServers = nextServers;
+  await writeFileAtomic(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  return { action: enabled ? (existing === undefined ? 'added' : 'updated') : 'removed' };
 }
 
 const CODEX_MANAGED_MARKER = '# Managed by Pane (Settings > AI & Agents). Pane rewrites this table on launch.';
@@ -291,11 +327,12 @@ function serverArgs(host: PaneMcpHost): string[] {
   return args;
 }
 
-/** The host's own Claude Code and Codex configs. */
+/** The host's own agent configs. */
 async function buildHostTarget(host: PaneMcpHost): Promise<McpRegistrationTarget> {
   const target: McpRegistrationTarget = {
     label: 'this machine',
     server: { command: host.executable, args: serverArgs(host), env: serverEnv(host.paneDir, false) },
+    userSkills: [],
   };
 
   const claude = host.claudeExecutablePath || await findExecutable('claude');
@@ -304,10 +341,17 @@ async function buildHostTarget(host: PaneMcpHost): Promise<McpRegistrationTarget
       configPath: path.join(process.env.CLAUDE_CONFIG_DIR || os.homedir(), '.claude.json'),
       run: (args) => runHostCli(claude, args),
     };
+    target.userSkills?.push({ client: 'Claude Code', skillsRoot: path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'skills') });
   }
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
   if (await exists(codexHome) || await findExecutable('codex')) {
     target.codex = { configPath: path.join(codexHome, 'config.toml') };
+    target.userSkills?.push({ client: 'Codex', skillsRoot: path.join(codexHome, 'skills') });
+  }
+  const cursorHome = path.join(os.homedir(), '.cursor');
+  if (await exists(cursorHome) || await findExecutable('cursor') || await findExecutable('agent') || await findExecutable('cursor-agent')) {
+    target.cursor = { configPath: path.join(cursorHome, 'mcp.json') };
+    target.userSkills?.push({ client: 'Cursor', skillsRoot: path.join(cursorHome, 'skills') });
   }
   return target;
 }
@@ -320,8 +364,11 @@ async function buildWslTarget(host: PaneMcpHost, distro: string): Promise<McpReg
   const probe = await runWsl(distro, [
     'command -v claude >/dev/null && echo claude=1',
     '{ [ -d "${CODEX_HOME:-$HOME/.codex}" ] || command -v codex >/dev/null; } && echo codex=1',
+    '{ [ -d "$HOME/.cursor" ] || command -v cursor >/dev/null || command -v agent >/dev/null || command -v cursor-agent >/dev/null; } && echo cursor=1',
+    'echo "cursorHome=$HOME/.cursor"',
     'echo "codexHome=${CODEX_HOME:-$HOME/.codex}"',
     'echo "claudeHome=${CLAUDE_CONFIG_DIR:-$HOME}"',
+    'echo "claudeSkillsHome=${CLAUDE_CONFIG_DIR:-$HOME/.claude}"',
     `echo "exe=$(wslpath -u ${escapeForBash(host.executable)})"`,
   ].join('; ')).catch(() => undefined);
   if (probe === undefined) return undefined;
@@ -332,15 +379,24 @@ async function buildWslTarget(host: PaneMcpHost, distro: string): Promise<McpReg
     label: `WSL (${distro})`,
     // wslpath honors a custom automount root; /mnt/<drive> is the default if it is unavailable.
     server: { command: values.exe?.startsWith('/') ? values.exe : windowsPathToWSLMount(host.executable), args: serverArgs(host), env: serverEnv(host.paneDir, true) },
+    userSkills: [],
   };
   if (values.claude === '1' && values.claudeHome?.startsWith('/')) {
     target.claude = {
       configPath: linuxToUNCPath(`${values.claudeHome}/.claude.json`, distro),
       run: async (args) => { await runWsl(distro, ['claude', ...args].map(escapeForBash).join(' ')); },
     };
+    if (values.claudeSkillsHome?.startsWith('/')) {
+      target.userSkills?.push({ client: 'Claude Code', skillsRoot: linuxToUNCPath(`${values.claudeSkillsHome}/skills`, distro) });
+    }
   }
   if (values.codex === '1' && values.codexHome?.startsWith('/')) {
     target.codex = { configPath: linuxToUNCPath(`${values.codexHome}/config.toml`, distro) };
+    target.userSkills?.push({ client: 'Codex', skillsRoot: linuxToUNCPath(`${values.codexHome}/skills`, distro) });
+  }
+  if (values.cursor === '1' && values.cursorHome?.startsWith('/')) {
+    target.cursor = { configPath: linuxToUNCPath(`${values.cursorHome}/mcp.json`, distro) };
+    target.userSkills?.push({ client: 'Cursor', skillsRoot: linuxToUNCPath(`${values.cursorHome}/skills`, distro) });
   }
   return target;
 }
@@ -416,7 +472,7 @@ const BUNDLED_RUNPANE_DIR = path.join(__dirname, '..', '..', '..', 'runpane');
 let syncQueue: Promise<void> = Promise.resolve();
 
 /**
- * Applies the "Register Pane tools" setting to every installed Claude Code and Codex on this
+ * Applies the "Register Pane tools" setting to every installed Claude Code, Codex, and Cursor on this
  * machine, one sync at a time so a settings toggle cannot interleave with the launch sync.
  * Only packaged builds register: a dev build would point every agent at a worktree.
  */
@@ -465,6 +521,7 @@ async function syncRegistrations(
   }
   await Promise.all(targets.map(async (target) => {
     if (!target) return;
+    await syncPaneUserSkills(target.userSkills ?? [], enabled);
     for (const outcome of await syncMcpRegistration(target, enabled)) {
       if (outcome.action === 'unchanged') continue;
       const detail = outcome.detail ? `: ${outcome.detail}` : '';
